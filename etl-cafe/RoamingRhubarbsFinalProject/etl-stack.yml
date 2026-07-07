@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: ETL Lambda stack
+
+Parameters:
+
+  DeploymentBucketName:
+    Type: String
+
+  RedshiftSsmParameterName:
+    Type: String
+
+  LambdaSubnetIds:
+      Type: List<AWS::EC2::Subnet::Id>
+
+  LambdaSecurityGroupIds:
+      Type: List<AWS::EC2::SecurityGroup::Id>
+
+Resources:
+
+  CsvBucket:
+
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt ETLLambda.Arn
+
+  CsvBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CsvBucket
+      PolicyDocument:
+        Statement:
+          - Sid: "AllowSSLRequestsOnly"
+            Action: "s3:*"
+            Principal: "*"
+            Effect: "Deny" # Block if...
+            Resource:
+              - !Sub "${CsvBucket.Arn}"
+              - !Sub "${CsvBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+
+  ETLLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: roamingrhubarbs-etl-lambda
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !Sub 'arn:aws:iam::660759886369:role/lambda-execution-role'
+      Code:
+        S3Bucket: !Ref DeploymentBucketName
+        S3Key: lambda.zip
+      Environment:
+        Variables:
+            REDSHIFT_SSM_PARAMETER_NAME: !Ref RedshiftSsmParameterName
+      VpcConfig:
+         SubnetIds: !Ref LambdaSubnetIds
+         SecurityGroupIds: !Ref LambdaSecurityGroupIds
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ETLLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+
+Outputs:
+
+  LambdaName:
+    Value: !Ref ETLLambda
+
+
+  

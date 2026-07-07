@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Deployment bucket for ETL Lambda package
+
+Resources:
+
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: # do not allow any public access
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+
+Outputs:
+
+  DeploymentBucketName:
+    Description: Name of the deployment bucket
+    Value: !Ref DeploymentBucket

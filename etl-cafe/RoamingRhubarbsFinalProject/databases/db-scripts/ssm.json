@@ -1,0 +1,7 @@
+{
+  "database-name": "roaming_rhubarb_cafe_db",
+  "host": "redshiftcluster-28evy6tdoci9.croifi5uilck.eu-west-1.redshift.amazonaws.com",
+  "port": 5439,
+  "password": "qCvJtz5TXxgoG",
+  "user": "roaming_rhubarb_user"
+}
