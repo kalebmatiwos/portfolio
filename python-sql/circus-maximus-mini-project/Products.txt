@@ -1,0 +1,6 @@
+Americano
+Cappucino
+Latte
+Macha
+Espresso
+Tea
