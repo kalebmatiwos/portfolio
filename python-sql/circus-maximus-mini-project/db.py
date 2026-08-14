@@ -1,3 +1,4 @@
+# Import module and Os 
 import psycopg2 
 import os
 
