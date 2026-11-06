@@ -1,0 +1,4 @@
+# dbt tooling -- never bundled into the Lambda package, only ever run
+# locally against the deployed Athena/Glue Data Catalog. dbt-athena-community
+# pulls in a matching dbt-core version automatically.
+dbt-athena-community>=1.11

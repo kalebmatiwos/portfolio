@@ -1,0 +1,17 @@
+name: 'take_home_assignment'
+version: '1.0.0'
+config-version: 2
+
+# Matches a profile block in your own ~/.dbt/profiles.yml, not committed
+# here since it holds connection info. See profiles.yml.example for the
+# exact shape this project expects.
+profile: 'take_home_assignment'
+
+model-paths: ["models"]
+
+models:
+  take_home_assignment:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

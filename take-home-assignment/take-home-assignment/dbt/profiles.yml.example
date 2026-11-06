@@ -1,0 +1,27 @@
+# Copy the relevant block into ~/.dbt/profiles.yml (create the file if it
+# doesn't exist yet) -- never commit your real profiles.yml, since some
+# setups put credentials in it.
+#
+# Two Athena-specific things worth knowing, both non-obvious the first
+# time round:
+#
+#   database:  this means the Athena Data Catalog, NOT the Glue database.
+#              Almost always the fixed value AwsDataCatalog -- every AWS
+#              account has exactly one, and it's addressed by this name
+#              regardless of account id.
+#   schema:    this is the actual Glue database name (e.g. gfw_clean) --
+#              confirm the exact name in the Glue console rather than
+#              guessing, since a crawler created by hand can easily end
+#              up with a different one than the CloudFormation-managed
+#              database the pipeline actually writes to.
+
+take_home_assignment:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      s3_staging_dir: s3://YOUR_BUCKET_NAME/athena-results/
+      region_name: eu-west-2
+      database: AwsDataCatalog
+      schema: gfw_clean
+      work_group: primary

@@ -1,0 +1,7 @@
+# The real dependency list now lives in src/requirements.txt, alongside
+# the Lambda handler code -- that's the only place SAM's builder looks
+# for it (CodeUri points at src/, and it only checks requirements.txt
+# directly inside CodeUri, not at the project root). This redirect just
+# keeps `pip install -r requirements.txt` from the project root working
+# the way the README describes.
+-r src/requirements.txt

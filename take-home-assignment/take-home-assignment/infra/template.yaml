@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Take Home Assignment -- GFW ingestion pipeline.
+  Deliberately Lambda + Step Functions + EventBridge rather than MWAA --
+  see README "Design choices" for why, given the startup-budget
+  constraint in the brief.
+
+Parameters:
+  GfwApiTokenSecretArn:
+    Type: String
+    Description: >
+      ARN of a Secrets Manager secret holding the GFW API token.
+      Created out-of-band (aws secretsmanager create-secret) -- never
+      passed as a plain-text parameter.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        RAW_BUCKET: !Ref DataBucket
+        GFW_API_TOKEN: !Sub "{{resolve:secretsmanager:${GfwApiTokenSecretArn}}}"
+
+Resources:
+
+  # --- Storage -----------------------------------------------------------------
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "take-home-assignment-gfw-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          # Raw zone is cheap to re-derive from the API within GFW's
+          # retention window, so it doesn't need to live forever at
+          # standard storage cost -- tune this once real usage patterns
+          # are known, this is a starting assumption.
+          - Id: ExpireRawAfter90Days
+            Prefix: raw/
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # --- Compute: extraction and validation ---------------------------------------
+
+  ExtractVesselsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: extract_vessels.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GfwApiTokenSecretArn
+
+  ExtractEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: extract_events.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref GfwApiTokenSecretArn
+
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: validate.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+
+  # --- Orchestration ------------------------------------------------------------
+  # Step Functions rather than raw Lambda chaining, so retries/failure
+  # handling are visible and configurable per step, and rather than MWAA
+  # because a two-source daily batch doesn't yet justify an always-on
+  # Airflow environment -- see README for the tradeoff and when that
+  # would flip.
+
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Definition:
+        Comment: Extract vessels -> extract events -> validate, each step's output feeding the next
+        StartAt: ExtractVessels
+        States:
+          ExtractVessels:
+            Type: Task
+            Resource: !GetAtt ExtractVesselsFunction.Arn
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 30
+                MaxAttempts: 2
+                BackoffRate: 2
+            Next: ExtractEvents
+          ExtractEvents:
+            Type: Task
+            Resource: !GetAtt ExtractEventsFunction.Arn
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 30
+                MaxAttempts: 2
+                BackoffRate: 2
+            Next: Validate
+          Validate:
+            Type: Task
+            Resource: !GetAtt ValidateFunction.Arn
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 30
+                MaxAttempts: 2
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: NotifyFailure
+            End: true
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref FailureTopic
+              Message: "Take Home Assignment GFW pipeline failed -- check the Step Functions execution history."
+            End: true
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            # Startup-budget-friendly: one scheduled run/day rather than
+            # a standing orchestrator. Tighten once near-real-time
+            # freshness is actually a product requirement.
+            Schedule: "rate(1 day)"
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractVesselsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractEventsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateFunction
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FailureTopic.TopicName
+
+  FailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: take-home-assignment-gfw-pipeline-failures
+
+  # --- Catalog: makes the clean zone queryable from Athena/dbt -----------------
+  #
+  # Static table definitions instead of a crawler: the clean zone's shape
+  # is fully known in advance (it's exactly what schemas.py validates
+  # records against before they're written), so there's nothing for a
+  # crawler to discover that isn't already declared here. Partition
+  # projection means Athena computes valid date partitions from the
+  # pattern below at query time -- new data is queryable the moment it
+  # lands in S3, with no crawler run, ever, and no MSCK REPAIR TABLE.
+  #
+  # Column shapes match the clean zone exactly, not the raw API response
+  # -- validate.py's Pydantic models (schemas.py) drop several raw-only
+  # fields (messagesCounter, positionsCounter, extraFields, and the rest
+  # of registryOwners/combinedSourcesInfo) before a record ever reaches
+  # the clean zone, so those aren't declared here either.
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: gfw_clean
+
+  VesselsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: dataset_vessels
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: "TRUE"
+          "projection.enabled": "true"
+          "projection.date.type": "date"
+          "projection.date.format": "yyyy-MM-dd"
+          "projection.date.range": "2025-01-01,NOW"
+          "projection.date.interval": "1"
+          "projection.date.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${DataBucket}/clean/gfw/dataset=vessels/date=${!date}/"
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/clean/gfw/dataset=vessels/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: dataset
+              Type: string
+            - Name: registryinfo
+              Type: "array<struct<id:string,ssvid:string,flag:string,shipname:string,callsign:string,imo:string,geartype:array<string>,lengthm:double,tonnagegt:double>>"
+            - Name: selfreportedinfo
+              Type: "array<struct<id:string,ssvid:string,shipname:string,flag:string,callsign:string,imo:string,transmissiondatefrom:string,transmissiondateto:string>>"
+
+  EventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: dataset_events
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: "TRUE"
+          "projection.enabled": "true"
+          "projection.date.type": "date"
+          "projection.date.format": "yyyy-MM-dd"
+          "projection.date.range": "2025-01-01,NOW"
+          "projection.date.interval": "1"
+          "projection.date.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${DataBucket}/clean/gfw/dataset=events/date=${!date}/"
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/clean/gfw/dataset=events/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: id
+              Type: string
+            - Name: type
+              Type: string
+            - Name: start
+              Type: string
+            - Name: end
+              Type: string
+            - Name: position
+              Type: "struct<lat:double,lon:double>"
+            - Name: regions
+              Type: "struct<mpa:array<string>,eez:array<string>,rfmo:array<string>,fao:array<string>>"
+            - Name: vessel
+              Type: "struct<id:string,name:string,ssvid:string,publicauthorizations:array<struct<rfmo:string,haspubliclylistedauthorization:string>>>"
+            - Name: distances
+              Type: "struct<startdistancefromshorekm:double,enddistancefromshorekm:double,startdistancefromportkm:double,enddistancefromportkm:double>"
+            - Name: fishing
+              Type: "struct<totaldistancekm:double,averagespeedknots:double,averagedurationhours:double,potentialrisk:boolean,vesselpublicauthorizationstatus:string>"
+            - Name: boundingbox
+              Type: "array<double>"
+
+Outputs:
+  DataBucketName:
+    Value: !Ref DataBucket
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase

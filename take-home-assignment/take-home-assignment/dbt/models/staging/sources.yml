@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: gfw_clean
+    description: >
+      Clean-zone GFW records, catalogued by the Glue crawler over the
+      clean S3 zone.
+    schema: gfw_clean
+    tables:
+      - name: dataset_vessels
+      - name: dataset_events
